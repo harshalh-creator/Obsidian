@@ -1,0 +1,9 @@
+# OBSIDIAN — Netlify config
+# Tells Netlify where the serverless function lives so it deploys
+# alongside your static site (index.html).
+
+[build]
+  publish = "."
+
+[functions]
+  directory = "netlify/functions"
