@@ -1,36 +1,22 @@
-/* =============================================================
- *  OBSIDIAN — NSE quote proxy
- *  Serves live NSE India equity quotes to the browser terminal.
+* =============================================================
+ *  OBSIDIAN — NSE proxy as a Netlify Function (modern format)
  *
- *  Why this exists: NSE/BSE block cross-origin browser requests
- *  (no CORS headers) and gate their API behind session cookies.
- *  This tiny proxy fetches NSE server-side, keeps a cookie jar,
- *  caches briefly, and re-exposes the data WITH CORS so the
- *  OBSIDIAN front-end can read it.
+ *  PLACE THIS FILE AT:  netlify/functions/nse.mjs
+ *  (delete any older netlify/functions/nse.js so there's only one)
  *
- *  Requirements: Node.js 18+ (uses built-in fetch & http). No npm install.
+ *  Endpoints once deployed:
+ *    https://obsidianharshalh.netlify.app/.netlify/functions/nse/health
+ *    https://obsidianharshalh.netlify.app/.netlify/functions/nse/quotes?symbols=RELIANCE,INFY
  *
- *  Run locally:      node nse-proxy.js
- *                    → listening on http://localhost:8787
- *  In OBSIDIAN:      open DATA, paste  http://localhost:8787  as the
- *                    NSE proxy URL, Save & Reconnect.
+ *  In OBSIDIAN set the proxy URL to:
+ *    https://YOURSITE.netlify.app/.netlify/functions/nse
  *
- *  Endpoints:
- *    GET /quotes?symbols=RELIANCE,INFY,TCS
- *        → { "RELIANCE": { "price": 2945.5, "prevClose": 2930, ... }, ... }
- *    GET /health  → { ok: true }
- *
- *  Deploy free: Render / Railway / Fly / a small VPS. Note that some
- *  cloud IP ranges are throttled by NSE; a home/VPS IP is most reliable.
- *  Set PORT via env var if your host requires it.
+ *  Runs on Netlify's Node runtime (global fetch/Request/Response). No npm install.
  * ============================================================= */
 
-const http = require("http");
-
-const PORT = process.env.PORT || 8787;
 const NSE_HOME = "https://www.nseindia.com";
-const CACHE_MS = 8000;          // serve cached quote for 8s per symbol
-const COOKIE_TTL_MS = 9 * 60e3; // refresh session cookie every ~9 min
+const CACHE_MS = 8000;
+const COOKIE_TTL_MS = 8 * 60e3;
 
 const BROWSER_HEADERS = {
   "User-Agent":
@@ -43,29 +29,27 @@ const BROWSER_HEADERS = {
 
 let cookie = "";
 let cookieAt = 0;
-const cache = new Map(); // symbol -> { at, data }
+const cache = new Map();
 
-/* --- cookie jar: NSE hands out cookies on the homepage --- */
-async function ensureCookie(force = false) {
+async function ensureCookie(force) {
   if (!force && cookie && Date.now() - cookieAt < COOKIE_TTL_MS) return;
   const res = await fetch(NSE_HOME, { headers: BROWSER_HEADERS });
-  const set = res.headers.getSetCookie ? res.headers.getSetCookie()
-            : (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")] : []);
+  let set = [];
+  if (typeof res.headers.getSetCookie === "function") set = res.headers.getSetCookie();
+  else if (res.headers.get("set-cookie")) set = [res.headers.get("set-cookie")];
   if (set.length) {
-    cookie = set.map(c => c.split(";")[0]).join("; ");
+    cookie = set.map((c) => c.split(";")[0]).join("; ");
     cookieAt = Date.now();
   }
 }
 
-async function fetchQuote(symbol) {
+async function fetchQuote(symbol, withMcap) {
   const hit = cache.get(symbol);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.data;
 
   await ensureCookie();
   const url = NSE_HOME + "/api/quote-equity?symbol=" + encodeURIComponent(symbol);
   let res = await fetch(url, { headers: { ...BROWSER_HEADERS, Cookie: cookie } });
-
-  // one retry with a fresh cookie if the session was rejected
   if (res.status === 401 || res.status === 403) {
     await ensureCookie(true);
     res = await fetch(url, { headers: { ...BROWSER_HEADERS, Cookie: cookie } });
@@ -78,16 +62,17 @@ async function fetchQuote(symbol) {
   const meta = j.metadata || {};
   const ind = j.industryInfo || {};
 
-  // second call for market cap (best effort — don't fail the quote if it errors)
   let mcap = null;
-  try {
-    const t = await fetch(url + "&section=trade_info", { headers: { ...BROWSER_HEADERS, Cookie: cookie } });
-    if (t.ok) {
-      const tj = await t.json();
-      const tc = tj && tj.marketDeptOrderBook && tj.marketDeptOrderBook.tradeInfo;
-      if (tc && tc.totalMarketCap != null) mcap = +tc.totalMarketCap; // ₹ Cr (approx)
-    }
-  } catch (e) {}
+  if (withMcap) {
+    try {
+      const t = await fetch(url + "&section=trade_info", { headers: { ...BROWSER_HEADERS, Cookie: cookie } });
+      if (t.ok) {
+        const tj = await t.json();
+        const tc = tj && tj.marketDeptOrderBook && tj.marketDeptOrderBook.tradeInfo;
+        if (tc && tc.totalMarketCap != null) mcap = +tc.totalMarketCap;
+      }
+    } catch (e) {}
+  }
 
   const data = {
     price: p.lastPrice ?? null,
@@ -100,7 +85,7 @@ async function fetchQuote(symbol) {
     change: p.change ?? null,
     pChange: p.pChange ?? null,
     name: info.companyName || symbol,
-    industry: ind.industry || ind.basicIndustry || info.industry || "—",
+    industry: ind.industry || ind.basicIndustry || info.industry || "\u2014",
     pe: meta.pdSymbolPe ? +meta.pdSymbolPe : null,
     mcap: mcap,
     ts: Date.now(),
@@ -109,42 +94,47 @@ async function fetchQuote(symbol) {
   return data;
 }
 
-function send(res, code, body) {
-  res.writeHead(code, {
-    "Content-Type": "application/json",
+async function mapLimit(arr, limit, fn) {
+  const out = [];
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, arr.length) }, async () => {
+    while (i < arr.length) {
+      const idx = i++;
+      out[idx] = await fn(arr[idx]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+export default async (req) => {
+  const cors = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "*",
+    "Content-Type": "application/json",
     "Cache-Control": "no-store",
-  });
-  res.end(JSON.stringify(body));
-}
+  };
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
 
-const server = http.createServer(async (req, res) => {
-  const u = new URL(req.url, "http://localhost");
-
-  if (req.method === "OPTIONS") return send(res, 204, {});
-  if (u.pathname === "/health") return send(res, 200, { ok: true, cookie: !!cookie });
-
-  if (u.pathname === "/quotes") {
-    const symbols = (u.searchParams.get("symbols") || "")
-      .split(",").map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 60);
-    if (!symbols.length) return send(res, 400, { error: "pass ?symbols=RELIANCE,INFY" });
-
-    const out = {};
-    // sequential with a tiny gap keeps NSE happy; symbols are cached 8s
-    for (const sym of symbols) {
-      try { out[sym] = await fetchQuote(sym); }
-      catch (e) { out[sym] = { error: String(e.message || e) }; }
-    }
-    return send(res, 200, out);
+  const url = new URL(req.url);
+  if (url.pathname.endsWith("/health")) {
+    return new Response(JSON.stringify({ ok: true, cookie: !!cookie }), { status: 200, headers: cors });
   }
 
-  send(res, 404, { error: "try /quotes?symbols=RELIANCE,INFY or /health" });
-});
+  const raw = url.searchParams.get("symbols") || "";
+  const symbols = raw.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean).slice(0, 50);
+  if (!symbols.length) {
+    return new Response(JSON.stringify({ error: "pass ?symbols=RELIANCE,INFY" }), { status: 400, headers: cors });
+  }
 
-server.listen(PORT, () => {
-  console.log(`OBSIDIAN NSE proxy → http://localhost:${PORT}`);
-  console.log(`  test: http://localhost:${PORT}/quotes?symbols=RELIANCE,INFY`);
-  ensureCookie().catch(() => {});
-});
+  try { await ensureCookie(); } catch (e) {}
+  const single = symbols.length === 1;
+  const results = await mapLimit(symbols, 8, async (sym) => {
+    try { return [sym, await fetchQuote(sym, single)]; }
+    catch (e) { return [sym, { error: String(e.message || e) }]; }
+  });
+  const out = {};
+  results.forEach(([s, d]) => (out[s] = d));
+  return new Response(JSON.stringify(out), { status: 200, headers: cors });
+};
